@@ -1,0 +1,413 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Expense Splitter</title>
+    <style>
+      :root { font-family: Arial, sans-serif; color: #1f2937; background: #f4f7fb; }
+      body { margin: 0; }
+      .container { max-width: 920px; margin: 0 auto; padding: 24px; }
+      .card { background: #fff; padding: 20px; border-radius: 12px; box-shadow: 0 8px 24px rgba(0,0,0,.08); margin-bottom: 16px; }
+      .row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+      input, select, button { box-sizing: border-box; padding: 10px; margin: 6px 0; border-radius: 8px; border: 1px solid #d1d5db; font: inherit; }
+      input, select { min-width: 180px; }
+      button { background: #2563eb; color: #fff; cursor: pointer; border-color: #2563eb; }
+      button:disabled { opacity: .55; cursor: not-allowed; }
+      button.secondary { background: #fff; color: #1f2937; border-color: #d1d5db; }
+      button.danger { background: #dc2626; border-color: #dc2626; }
+      .button-link { display: inline-block; padding: 10px; margin: 6px 0; border: 1px solid #d1d5db; border-radius: 8px; color: #1f2937; text-decoration: none; }
+      .status { min-height: 1.25em; margin-bottom: 10px; color: #2563eb; font-weight: bold; }
+      .error { color: #dc2626; }
+      .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; }
+      .balance { font-size: 1.1rem; font-weight: bold; padding: 4px 0; }
+      .negative { color: #dc2626; }
+      .positive { color: #059669; }
+      .expense, .member { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 8px 0; border-bottom: 1px solid #e5e7eb; }
+      .expense:last-child, .member:last-child { border-bottom: 0; }
+      .expense-info { overflow-wrap: anywhere; }
+      .expense button, .member button { flex: none; }
+      .participants { display: flex; flex-wrap: wrap; gap: 12px; margin: 8px 0 14px; }
+      .participants label { display: inline-flex; align-items: center; gap: 4px; }
+      .participants input { min-width: auto; margin: 0; }
+      .hint { color: #6b7280; font-size: .95rem; }
+      @media (max-width: 560px) {
+        .container { padding: 14px; }
+        .card { padding: 16px; }
+        .row > input, .row > select { flex: 1 1 100%; }
+      }
+    </style>
+  </head>
+  <body>
+    <main class="container">
+      <h1>Expense Splitter</h1>
+      <div id="status" class="status" role="status" aria-live="polite"></div>
+
+      <section class="card" aria-labelledby="splits-title">
+        <h2 id="splits-title">Splits</h2>
+        <div class="row">
+          <label for="splitSelect">Saved splits</label>
+          <select id="splitSelect" aria-label="Select a saved split"></select>
+          <button class="secondary" type="button" onclick="switchSplit()">Open split</button>
+          <button class="danger" type="button" onclick="deleteSelectedSplit()">Delete selected split</button>
+          <a class="button-link" href="/api/export.csv">Export CSV</a>
+        </div>
+        <div class="row">
+          <input id="newSplitName" maxlength="80" placeholder="New split name (optional)" />
+          <button type="button" onclick="createNewSplit()">Create empty split</button>
+        </div>
+      </section>
+
+      <section class="card" aria-labelledby="expense-title">
+        <h2 id="expense-title">Add Expense</h2>
+        <div class="row">
+          <input id="description" maxlength="120" placeholder="Description" aria-label="Description" />
+          <input id="amount" type="number" min="0.01" step="0.01" placeholder="Amount" aria-label="Amount" />
+          <select id="paidBy" aria-label="Paid by"></select>
+        </div>
+        <h3>Split between</h3>
+        <div id="participants" class="participants"></div>
+        <button id="addExpenseButton" type="button" onclick="addExpense()">Add Expense</button>
+      </section>
+
+      <section class="card" aria-labelledby="member-title">
+        <h2 id="member-title">Members</h2>
+        <div class="row">
+          <input id="memberName" maxlength="80" placeholder="Member name" aria-label="Member name" />
+          <button type="button" onclick="addMember()">Add Member</button>
+        </div>
+        <ul id="members"></ul>
+      </section>
+
+      <div class="grid">
+        <section class="card">
+          <h2>Summary</h2>
+          <div id="summary"></div>
+        </section>
+        <section class="card">
+          <h2>Balances</h2>
+          <div id="balances"></div>
+        </section>
+      </div>
+
+      <section class="card">
+        <h2>Suggested Settlements</h2>
+        <ul id="settlements"></ul>
+      </section>
+
+      <section class="card">
+        <h2>Expenses</h2>
+        <ul id="expenses"></ul>
+      </section>
+    </main>
+
+    <script>
+      const element = (id) => document.getElementById(id);
+      let savedSplits = [];
+
+      function showStatus(message, isError = false) {
+        const status = element('status');
+        status.textContent = message;
+        status.classList.toggle('error', isError);
+      }
+
+      async function request(url, options) {
+        const response = await fetch(url, options);
+        const result = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(result.error || 'The request could not be completed.');
+        return result;
+      }
+
+      function addListMessage(list, message) {
+        const item = document.createElement('li');
+        item.textContent = message;
+        list.replaceChildren(item);
+      }
+
+      function renderSplits(splitData) {
+        savedSplits = splitData.splits;
+        const select = element('splitSelect');
+        select.replaceChildren();
+        splitData.splits.forEach((split, index) => {
+          const option = document.createElement('option');
+          option.value = split.id;
+          option.textContent = `${split.name || `Untitled split ${index + 1}`} (${split.memberCount} members, ${split.expenseCount} expenses)`;
+          option.selected = split.id === splitData.activeSplitId;
+          select.append(option);
+        });
+      }
+
+      function renderMembers(members, expenses) {
+        const list = element('members');
+        list.replaceChildren();
+        if (!members.length) {
+          addListMessage(list, 'No members yet. Add members to start splitting expenses.');
+          return;
+        }
+
+        members.forEach((member) => {
+          const item = document.createElement('li');
+          item.className = 'member';
+          const name = document.createElement('span');
+          name.textContent = member;
+          const remove = document.createElement('button');
+          remove.type = 'button';
+          remove.className = 'danger';
+          remove.textContent = 'Remove';
+          remove.disabled = expenses.some((expense) =>
+            expense.paidBy.toLowerCase() === member.toLowerCase()
+            || (expense.participants || []).some((participant) =>
+              participant.toLowerCase() === member.toLowerCase())
+          );
+          remove.title = remove.disabled
+            ? 'This member is used by a saved expense and cannot be removed.'
+            : `Remove ${member}`;
+          remove.addEventListener('click', () => removeMember(member));
+          item.append(name, remove);
+          list.append(item);
+        });
+      }
+
+      function renderParticipantChoices(members) {
+        const container = element('participants');
+        container.replaceChildren();
+        members.forEach((member, index) => {
+          const label = document.createElement('label');
+          const checkbox = document.createElement('input');
+          checkbox.type = 'checkbox';
+          checkbox.name = 'participants';
+          checkbox.value = member;
+          checkbox.checked = true;
+          checkbox.id = `participant-${index}`;
+          const text = document.createElement('span');
+          text.textContent = member;
+          label.append(checkbox, text);
+          container.append(label);
+        });
+
+        const payer = element('paidBy');
+        payer.replaceChildren();
+        const emptyOption = document.createElement('option');
+        emptyOption.value = '';
+        emptyOption.textContent = members.length ? 'Select who paid' : 'Add a member first';
+        payer.append(emptyOption);
+        members.forEach((member) => {
+          const option = document.createElement('option');
+          option.value = member;
+          option.textContent = member;
+          payer.append(option);
+        });
+        element('addExpenseButton').disabled = members.length === 0;
+        if (!members.length) {
+          const message = document.createElement('span');
+          message.className = 'hint';
+          message.textContent = 'Add members before recording an expense.';
+          container.append(message);
+        }
+      }
+
+      function renderExpenses(expenses) {
+        const list = element('expenses');
+        list.replaceChildren();
+        if (!expenses.length) {
+          addListMessage(list, 'No expenses in this split yet.');
+          return;
+        }
+
+        expenses.forEach((expense) => {
+          const item = document.createElement('li');
+          item.className = 'expense';
+          const info = document.createElement('span');
+          info.className = 'expense-info';
+          const sharedBy = (expense.participants || []).join(', ');
+          info.textContent = `${expense.description} — ${expense.amount} paid by ${expense.paidBy}; split between ${sharedBy}`;
+          const remove = document.createElement('button');
+          remove.type = 'button';
+          remove.className = 'danger';
+          remove.textContent = 'Delete';
+          remove.setAttribute('aria-label', `Delete expense ${expense.description}`);
+          remove.addEventListener('click', () => removeExpense(expense.id));
+          item.append(info, remove);
+          list.append(item);
+        });
+      }
+
+      function renderGroup(group, balances, summary, settlements) {
+        element('summary').textContent = `Total expenses: ${summary.total_expenses} · Members: ${summary.member_count}`;
+
+        const balanceList = element('balances');
+        balanceList.replaceChildren();
+        if (!balances.length) {
+          balanceList.textContent = 'Add members to see balances.';
+        } else {
+          balances.forEach((balance) => {
+            const item = document.createElement('div');
+            item.className = `balance ${balance.amount < 0 ? 'negative' : 'positive'}`;
+            item.textContent = `${balance.member}: ${balance.amount}`;
+            balanceList.append(item);
+          });
+        }
+
+        const settlementList = element('settlements');
+        settlementList.replaceChildren();
+        if (!settlements.length) {
+          addListMessage(settlementList, 'No settlements needed.');
+        } else {
+          settlements.forEach((settlement) => {
+            const item = document.createElement('li');
+            item.textContent = `${settlement.from} should pay ${settlement.to} ${settlement.amount}`;
+            settlementList.append(item);
+          });
+        }
+
+        renderMembers(group.members, group.expenses);
+        renderParticipantChoices(group.members);
+        renderExpenses(group.expenses);
+      }
+
+      async function loadData() {
+        try {
+          const [splitData, group, balances, summary, settlements] = await Promise.all([
+            request('/api/splits'),
+            request('/api/group'),
+            request('/api/balances'),
+            request('/api/summary'),
+            request('/api/settlements')
+          ]);
+          renderSplits(splitData);
+          renderGroup(group, balances, summary, settlements);
+        } catch (error) {
+          showStatus(error.message || 'Unable to load split data.', true);
+        }
+      }
+
+      async function createNewSplit() {
+        try {
+          await request('/api/splits', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name: element('newSplitName').value.trim() })
+          });
+          element('newSplitName').value = '';
+          element('description').value = '';
+          element('amount').value = '';
+          element('memberName').value = '';
+          showStatus('New empty split created. Your previous splits are saved.');
+          await loadData();
+        } catch (error) {
+          showStatus(error.message || 'Could not create split.', true);
+        }
+      }
+
+      async function switchSplit() {
+        try {
+          await request(`/api/splits/${encodeURIComponent(element('splitSelect').value)}/activate`, {
+            method: 'POST'
+          });
+          showStatus('Split opened.');
+          await loadData();
+        } catch (error) {
+          showStatus(error.message || 'Could not open split.', true);
+        }
+      }
+
+      async function deleteSelectedSplit() {
+        const splitId = element('splitSelect').value;
+        const selectedSplit = savedSplits.find((split) => split.id === splitId);
+        if (!selectedSplit) {
+          showStatus('Select a saved split to delete.', true);
+          return;
+        }
+
+        const splitName = selectedSplit.name || 'Untitled split';
+        const lastSplit = savedSplits.length === 1;
+        const replacementWarning = lastSplit
+          ? '\n\nA new blank split will be created so the app remains ready to use.'
+          : '';
+        const confirmed = window.confirm(
+          `Delete "${splitName}" and all its members and expenses? This cannot be undone.${replacementWarning}`
+        );
+        if (!confirmed) return;
+
+        try {
+          await request(`/api/splits/${encodeURIComponent(splitId)}`, { method: 'DELETE' });
+          showStatus(lastSplit
+            ? 'Split deleted. A new blank split is ready.'
+            : `Split "${splitName}" deleted.`);
+          await loadData();
+        } catch (error) {
+          showStatus(error.message || 'Could not delete split.', true);
+        }
+      }
+
+      async function addExpense() {
+        const description = element('description').value.trim();
+        const amount = Number(element('amount').value);
+        const paidBy = element('paidBy').value;
+        const participants = [...document.querySelectorAll('input[name="participants"]:checked')]
+          .map((checkbox) => checkbox.value);
+        if (!description || !Number.isFinite(amount) || amount <= 0 || !paidBy || !participants.length) {
+          showStatus('Enter a description and positive amount, choose who paid, and select at least one participant.', true);
+          return;
+        }
+
+        try {
+          await request('/api/expenses', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ description, amount, paidBy, participants, splitType: 'equal' })
+          });
+          element('description').value = '';
+          element('amount').value = '';
+          showStatus('Expense added.');
+          await loadData();
+        } catch (error) {
+          showStatus(error.message || 'Could not add expense.', true);
+        }
+      }
+
+      async function addMember() {
+        const name = element('memberName').value.trim();
+        if (!name) {
+          showStatus('Enter a member name.', true);
+          return;
+        }
+        try {
+          await request('/api/members', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name })
+          });
+          element('memberName').value = '';
+          showStatus('Member added.');
+          await loadData();
+        } catch (error) {
+          showStatus(error.message || 'Could not add member.', true);
+        }
+      }
+
+      async function removeMember(name) {
+        try {
+          await request(`/api/members/${encodeURIComponent(name)}`, { method: 'DELETE' });
+          showStatus(`${name} removed.`);
+          await loadData();
+        } catch (error) {
+          showStatus(error.message || 'Could not remove member.', true);
+        }
+      }
+
+      async function removeExpense(id) {
+        if (!window.confirm('Delete this expense? This will update the split balances.')) return;
+        try {
+          await request(`/api/expenses/${encodeURIComponent(id)}`, { method: 'DELETE' });
+          showStatus('Expense deleted.');
+          await loadData();
+        } catch (error) {
+          showStatus(error.message || 'Could not delete expense.', true);
+        }
+      }
+
+      loadData();
+    </script>
+  </body>
+</html>
