@@ -138,6 +138,10 @@ async function initializeDatabase() {
       `, [String(groups.rows[0].id)]);
     }
   } catch (error) {
+    if (process.env.REQUIRE_DATABASE === 'true') {
+      console.error('PostgreSQL is required but could not be initialized.');
+      throw error;
+    }
     console.warn('PostgreSQL is unavailable. Falling back to the local JSON data store.');
     useLocalStorage = true;
     readLocalState();
