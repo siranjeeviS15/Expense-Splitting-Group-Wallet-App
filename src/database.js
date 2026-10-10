@@ -50,7 +50,8 @@ function readLocalState() {
   state.users = state.users.map((user) => ({
     ...user,
     id: String(user.id || randomUUID()),
-    email: String(user.email || '').toLowerCase()
+    email: typeof user.email === 'string' ? user.email.toLowerCase() : null,
+    phone: typeof user.phone === 'string' ? user.phone : null
   }));
   for (const split of state.splits) {
     split.id = String(split.id || randomUUID());
@@ -80,13 +81,18 @@ function userFromRow(row) {
   return {
     id: String(row.id),
     email: row.email,
+    phone: row.phone_e164 || row.phone || null,
     passwordHash: row.password_hash || null,
     googleId: row.google_id || null
   };
 }
 
 function publicUser(user) {
-  return user ? { id: user.id, email: user.email } : null;
+  return user ? {
+    id: String(user.id),
+    email: user.email || null,
+    phone: user.phone_e164 || user.phone || null
+  } : null;
 }
 
 function newSplit(ownerId, name = '') {
@@ -121,6 +127,7 @@ async function createUser(email, passwordHash) {
     const user = {
       id: randomUUID(),
       email: normalizedEmail,
+      phone: null,
       passwordHash,
       googleId: null
     };
@@ -133,7 +140,7 @@ async function createUser(email, passwordHash) {
     const result = await pool.query(`
       INSERT INTO app_users (email, password_hash)
       VALUES ($1, $2)
-      RETURNING id, email, password_hash, google_id
+      RETURNING id, email, phone_e164, password_hash, google_id
     `, [normalizedEmail, passwordHash]);
     return publicUser(userFromRow(result.rows[0]));
   } catch (error) {
@@ -153,7 +160,7 @@ async function findUserByEmail(email) {
     return state.users.find((user) => user.email === normalizedEmail) || null;
   }
   const result = await pool.query(
-    'SELECT id, email, password_hash, google_id FROM app_users WHERE email = $1',
+    'SELECT id, email, phone_e164, password_hash, google_id FROM app_users WHERE email = $1',
     [normalizedEmail]
   );
   return userFromRow(result.rows[0]);
@@ -164,7 +171,7 @@ async function findUserById(userId) {
     return publicUser(localUser(readLocalState(), userId));
   }
   const result = await pool.query(
-    'SELECT id, email FROM app_users WHERE id = $1',
+    'SELECT id, email, phone_e164 FROM app_users WHERE id = $1',
     [userId]
   );
   return publicUser(result.rows[0]);
@@ -187,6 +194,7 @@ async function findOrCreateGoogleUser(email, googleId) {
     const user = {
       id: randomUUID(),
       email: normalizedEmail,
+      phone: null,
       passwordHash: null,
       googleId
     };
@@ -196,7 +204,7 @@ async function findOrCreateGoogleUser(email, googleId) {
   }
 
   const byGoogle = await pool.query(
-    'SELECT id, email FROM app_users WHERE google_id = $1',
+    'SELECT id, email, phone_e164 FROM app_users WHERE google_id = $1',
     [googleId]
   );
   if (byGoogle.rowCount) return publicUser(byGoogle.rows[0]);
@@ -215,7 +223,7 @@ async function findOrCreateGoogleUser(email, googleId) {
     const result = await pool.query(`
       INSERT INTO app_users (email, google_id)
       VALUES ($1, $2)
-      RETURNING id, email
+      RETURNING id, email, phone_e164
     `, [normalizedEmail, googleId]);
     return publicUser(result.rows[0]);
   } catch (error) {
@@ -228,6 +236,34 @@ async function findOrCreateGoogleUser(email, googleId) {
   }
 }
 
+async function findOrCreatePhoneUser(phone) {
+  const phoneNumber = String(phone);
+  if (useLocalStorage) {
+    const state = readLocalState();
+    let user = state.users.find((entry) => entry.phone === phoneNumber);
+    if (!user) {
+      user = {
+        id: randomUUID(),
+        email: null,
+        phone: phoneNumber,
+        passwordHash: null,
+        googleId: null
+      };
+      state.users.push(user);
+      writeLocalState(state);
+    }
+    return publicUser(user);
+  }
+
+  const result = await pool.query(`
+    INSERT INTO app_users (phone_e164)
+    VALUES ($1)
+    ON CONFLICT (phone_e164) DO UPDATE SET phone_e164 = EXCLUDED.phone_e164
+    RETURNING id, email, phone_e164
+  `, [phoneNumber]);
+  return publicUser(result.rows[0]);
+}
+
 async function initializeDatabase() {
   if (useLocalStorage) {
     readLocalState();
@@ -238,12 +274,26 @@ async function initializeDatabase() {
     await pool.query(`
       CREATE TABLE IF NOT EXISTS app_users (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        email TEXT NOT NULL UNIQUE,
+        email TEXT UNIQUE,
+        phone_e164 TEXT UNIQUE,
         password_hash TEXT,
         google_id TEXT UNIQUE,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        CHECK (password_hash IS NOT NULL OR google_id IS NOT NULL)
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
+      ALTER TABLE app_users ALTER COLUMN email DROP NOT NULL;
+      ALTER TABLE app_users ADD COLUMN IF NOT EXISTS phone_e164 TEXT UNIQUE;
+      ALTER TABLE app_users DROP CONSTRAINT IF EXISTS app_users_check;
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_constraint
+          WHERE conname = 'app_users_auth_method_check'
+            AND conrelid = 'app_users'::regclass
+        ) THEN
+          ALTER TABLE app_users ADD CONSTRAINT app_users_auth_method_check
+            CHECK (password_hash IS NOT NULL OR google_id IS NOT NULL OR phone_e164 IS NOT NULL);
+        END IF;
+      END $$;
       CREATE TABLE IF NOT EXISTS groups (
         id SERIAL PRIMARY KEY,
         owner_id UUID REFERENCES app_users(id) ON DELETE CASCADE,
@@ -629,6 +679,7 @@ module.exports = {
   deleteMember,
   deleteSplit,
   findOrCreateGoogleUser,
+  findOrCreatePhoneUser,
   findUserByEmail,
   findUserById,
   getSplits,
