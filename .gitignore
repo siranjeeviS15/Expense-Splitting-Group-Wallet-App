@@ -1,0 +1,11 @@
+node_modules/
+.env
+.env.*
+!.env.example
+data.json
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.code-workspace
+npm-debug.log*
