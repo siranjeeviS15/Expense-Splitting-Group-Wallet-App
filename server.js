@@ -25,6 +25,10 @@ app.use(express.static(path.join(__dirname, 'public')));
 let group;
 let activeSplitId;
 
+app.get('/health', (req, res) => {
+  res.status(group ? 200 : 503).json({ status: group ? 'ok' : 'starting' });
+});
+
 app.get('/api/group', (req, res) => res.json(group));
 
 app.get('/api/splits', async (req, res) => {
