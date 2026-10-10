@@ -15,6 +15,7 @@ const {
   deleteMember,
   deleteSplit,
   findOrCreateGoogleUser,
+  findOrCreatePhoneUser,
   findUserByEmail,
   findUserById,
   getSplits,
@@ -25,12 +26,18 @@ const {
   setActiveSplit
 } = require('./src/database');
 const { hashPassword, validateEmail, verifyPassword } = require('./src/authService');
+const { checkVerification, sendVerification, validatePhoneNumber } = require('./src/twilioVerify');
 
 const app = express();
 const port = Number(process.env.PORT || 3000);
 const isProduction = process.env.NODE_ENV === 'production';
 let databaseReady = false;
 let googleEnabled = false;
+const phoneEnabled = Boolean(
+  process.env.TWILIO_ACCOUNT_SID
+  && process.env.TWILIO_AUTH_TOKEN
+  && process.env.TWILIO_VERIFY_SERVICE_SID
+);
 
 if (isProduction) {
   app.set('trust proxy', 1);
@@ -114,6 +121,22 @@ const authLimiter = rateLimit({
   message: { error: 'Too many sign-in attempts. Please try again later.' }
 });
 
+const phoneSendLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 3,
+  standardHeaders: 'draft-8',
+  legacyHeaders: false,
+  message: { error: 'Too many code requests. Please try again later.' }
+});
+
+const phoneVerifyLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 8,
+  standardHeaders: 'draft-8',
+  legacyHeaders: false,
+  message: { error: 'Too many verification attempts. Please try again later.' }
+});
+
 function getCsrfToken(req) {
   if (!req.session.csrfToken) {
     req.session.csrfToken = randomBytes(32).toString('base64url');
@@ -169,9 +192,12 @@ app.get('/health', (req, res) => {
 app.get('/api/auth/me', (req, res) => {
   res.json({
     authenticated: Boolean(req.user),
-    user: req.user ? { id: req.user.id, email: req.user.email } : null,
+    user: req.user
+      ? { id: req.user.id, email: req.user.email, phone: req.user.phone || null }
+      : null,
     csrfToken: getCsrfToken(req),
-    googleEnabled
+    googleEnabled,
+    phoneEnabled
   });
 });
 
@@ -220,6 +246,53 @@ app.post('/api/auth/login', authLimiter, requireCsrf, async (req, res) => {
     return res.status(status).json({
       error: status === 500 ? 'Unable to sign in right now.' : error.message
     });
+  }
+});
+
+app.post('/api/auth/phone/send', phoneSendLimiter, requireCsrf, async (req, res) => {
+  try {
+    const phone = validatePhoneNumber(req.body.phone);
+    await sendVerification(phone);
+    return res.json({ sent: true });
+  } catch (error) {
+    if (error.code === 'INVALID_PHONE') {
+      return res.status(400).json({ error: error.message });
+    }
+    if (error.code === 'TWILIO_NOT_CONFIGURED') {
+      return res.status(503).json({ error: 'Phone sign-in is not configured.' });
+    }
+    console.error('Phone verification request failed:', error.code || 'PROVIDER_ERROR');
+    return res.status(502).json({ error: 'Could not send a verification code. Please try again later.' });
+  }
+});
+
+app.post('/api/auth/phone/verify', phoneVerifyLimiter, requireCsrf, async (req, res) => {
+  try {
+    const phone = validatePhoneNumber(req.body.phone);
+    const approved = await checkVerification(phone, req.body.code);
+    if (!approved) {
+      return res.status(401).json({ error: 'The verification code is incorrect or expired.' });
+    }
+    const user = await findOrCreatePhoneUser(phone);
+    await loginUser(req, user);
+    req.session.csrfToken = randomBytes(32).toString('base64url');
+    return res.json({
+      authenticated: true,
+      user,
+      csrfToken: req.session.csrfToken
+    });
+  } catch (error) {
+    if (error.code === 'INVALID_PHONE' || error.code === 'INVALID_OTP') {
+      return res.status(400).json({ error: error.message });
+    }
+    if (error.code === 'TWILIO_NOT_CONFIGURED') {
+      return res.status(503).json({ error: 'Phone sign-in is not configured.' });
+    }
+    if (error.code === 'TWILIO_REJECTED' && [400, 404].includes(error.providerStatus)) {
+      return res.status(401).json({ error: 'The verification code is incorrect or expired.' });
+    }
+    console.error('Phone verification failed:', error.code || 'PROVIDER_ERROR');
+    return res.status(502).json({ error: 'Could not verify this code. Please try again later.' });
   }
 });
 

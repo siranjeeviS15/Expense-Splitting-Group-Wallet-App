@@ -19,6 +19,8 @@ The Blueprint generates a `SESSION_SECRET`. To enable optional Google sign-in:
 
 Email/password registration works without Google credentials. Passwords are stored as salted scrypt hashes, and authenticated sessions are stored in PostgreSQL. Email verification and password recovery are not configured.
 
+To enable phone OTP sign-in, create a Twilio Verify Service and add `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, and `TWILIO_VERIFY_SERVICE_SID` as secrets in the Render web service environment, then redeploy. The phone sign-in button is shown only when all three values are present. The app accepts E.164 phone numbers (for example, `+14155552671`). A verified number without an existing phone account creates a separate phone-only account; it is not automatically linked to an email or Google account.
+
 ## Data and plan notes
 
 New PostgreSQL deployments start with a blank split. Existing local `data.json` is not uploaded or automatically imported; export and migrate any data you need separately before relying on the cloud app.

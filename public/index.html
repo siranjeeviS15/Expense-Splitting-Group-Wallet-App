@@ -35,9 +35,14 @@
       .auth-card { max-width: 440px; margin: 8vh auto 0; }
       .auth-card form { display: grid; gap: 8px; }
       .auth-card form input { width: 100%; }
+      .password-field { display: flex; gap: 8px; }
+      .password-field input { flex: 1; min-width: 0; }
+      .password-field button { margin: 6px 0; }
       .auth-actions { display: flex; gap: 8px; flex-wrap: wrap; }
       .auth-actions button { flex: 1; }
       .auth-divider { text-align: center; color: #6b7280; margin: 18px 0 6px; }
+      .phone-auth { display: grid; gap: 8px; }
+      .phone-auth input { width: 100%; }
       .account-bar { display: flex; justify-content: flex-end; align-items: center; gap: 12px; }
       @media (max-width: 560px) {
         .container { padding: 14px; }
@@ -54,13 +59,29 @@
         <label for="authEmail">Email</label>
         <input id="authEmail" type="email" autocomplete="email" maxlength="254" required />
         <label for="authPassword">Password</label>
-        <input id="authPassword" type="password" autocomplete="current-password" minlength="12" maxlength="1024" required />
+        <div class="password-field">
+          <input id="authPassword" type="password" autocomplete="current-password" minlength="12" maxlength="1024" required />
+          <button id="togglePassword" class="secondary" type="button" aria-label="Show password" aria-pressed="false">Show</button>
+        </div>
         <div class="auth-actions">
           <button id="authSubmit" type="submit">Sign in</button>
           <button id="authModeToggle" class="secondary" type="button">Create account</button>
         </div>
       </form>
       <p id="passwordHint" class="hint" hidden>Use at least 12 characters for a new password.</p>
+      <button id="phoneModeToggle" class="secondary" type="button" hidden>Use phone number instead</button>
+      <section id="phoneAuthPanel" class="phone-auth" aria-label="Phone sign-in" hidden>
+        <label for="phoneNumber">Phone number</label>
+        <input id="phoneNumber" type="tel" autocomplete="tel" inputmode="tel" maxlength="16" placeholder="+14155552671" />
+        <p class="hint">Enter your number with its country code, starting with +.</p>
+        <button id="sendPhoneCode" type="button">Send one-time code</button>
+        <div id="phoneCodeGroup" hidden>
+          <label for="phoneCode">Verification code</label>
+          <input id="phoneCode" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="10" pattern="[0-9]{4,10}" />
+          <button id="verifyPhoneCode" type="button">Verify and sign in</button>
+        </div>
+        <button id="emailModeToggle" class="secondary" type="button">Use email instead</button>
+      </section>
       <p id="googleDivider" class="auth-divider" hidden>or</p>
       <a id="googleSignIn" class="button-link" href="/auth/google" hidden>Continue with Google</a>
     </section>
@@ -137,6 +158,7 @@
       let csrfToken;
       let authMode = 'login';
       let currentUser;
+      let phoneCodeSent = false;
 
       function showStatus(message, isError = false) {
         const status = element('status');
@@ -167,7 +189,7 @@
         currentUser = user;
         element('authPanel').hidden = true;
         element('application').hidden = false;
-        element('accountEmail').textContent = user.email;
+        element('accountEmail').textContent = user.email || user.phone || '';
       }
 
       function showLogin(message = '') {
@@ -176,7 +198,30 @@
         element('authPanel').hidden = false;
         element('authEmail').value = '';
         element('authPassword').value = '';
+        element('phoneNumber').value = '';
+        element('phoneCode').value = '';
+        element('phoneCodeGroup').hidden = true;
+        phoneCodeSent = false;
+        setAuthMethod('email');
+        setPasswordVisible(false);
         setAuthStatus(message);
+      }
+
+      function setAuthMethod(method) {
+        const usePhone = method === 'phone';
+        element('authForm').hidden = usePhone;
+        element('passwordHint').hidden = usePhone || authMode !== 'register';
+        element('phoneAuthPanel').hidden = !usePhone;
+        element('phoneModeToggle').hidden = usePhone;
+      }
+
+      function setPasswordVisible(visible) {
+        const password = element('authPassword');
+        const toggle = element('togglePassword');
+        password.type = visible ? 'text' : 'password';
+        toggle.textContent = visible ? 'Hide' : 'Show';
+        toggle.setAttribute('aria-label', visible ? 'Hide password' : 'Show password');
+        toggle.setAttribute('aria-pressed', String(visible));
       }
 
       function setAuthMode(mode) {
@@ -187,7 +232,7 @@
         element('authModeToggle').textContent = registering ? 'I already have an account' : 'Create account';
         element('authPassword').autocomplete = registering ? 'new-password' : 'current-password';
         element('authPassword').minLength = registering ? 12 : 1;
-        element('passwordHint').hidden = !registering;
+        element('passwordHint').hidden = !registering || element('phoneAuthPanel').hidden === false;
       }
 
       async function initializeAuth() {
@@ -196,6 +241,7 @@
           csrfToken = auth.csrfToken;
           element('googleSignIn').hidden = !auth.googleEnabled;
           element('googleDivider').hidden = !auth.googleEnabled;
+          element('phoneModeToggle').hidden = !auth.phoneEnabled;
           const params = new URLSearchParams(window.location.search);
           if (params.get('authError') === 'google') {
             setAuthStatus('Google sign-in failed or could not be linked. Try email/password or contact support.', true);
@@ -235,6 +281,53 @@
           setAuthStatus(error.message || 'Authentication failed.', true);
         } finally {
           submit.disabled = false;
+        }
+      }
+
+      async function sendPhoneCode() {
+        const button = element('sendPhoneCode');
+        button.disabled = true;
+        setAuthStatus('Sending a verification code…');
+        try {
+          await request('/api/auth/phone/send', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ phone: element('phoneNumber').value.trim() })
+          });
+          phoneCodeSent = true;
+          element('phoneCodeGroup').hidden = false;
+          button.textContent = 'Resend code';
+          setAuthStatus('Code sent. Check your phone.');
+          element('phoneCode').focus();
+        } catch (error) {
+          setAuthStatus(error.message || 'Could not send a verification code.', true);
+        } finally {
+          button.disabled = false;
+        }
+      }
+
+      async function verifyPhoneCode() {
+        if (!phoneCodeSent) return;
+        const button = element('verifyPhoneCode');
+        button.disabled = true;
+        setAuthStatus('Verifying code…');
+        try {
+          const result = await request('/api/auth/phone/verify', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              phone: element('phoneNumber').value.trim(),
+              code: element('phoneCode').value.trim()
+            })
+          });
+          csrfToken = result.csrfToken;
+          showAuthenticated(result.user);
+          showStatus('Signed in successfully.');
+          await loadData();
+        } catch (error) {
+          setAuthStatus(error.message || 'Could not verify this code.', true);
+        } finally {
+          button.disabled = false;
         }
       }
 
@@ -548,6 +641,19 @@
         setAuthMode(authMode === 'login' ? 'register' : 'login');
         setAuthStatus('');
       });
+      element('togglePassword').addEventListener('click', () => {
+        setPasswordVisible(element('authPassword').type === 'password');
+      });
+      element('phoneModeToggle').addEventListener('click', () => {
+        setAuthMethod('phone');
+        setAuthStatus('');
+      });
+      element('emailModeToggle').addEventListener('click', () => {
+        setAuthMethod('email');
+        setAuthStatus('');
+      });
+      element('sendPhoneCode').addEventListener('click', sendPhoneCode);
+      element('verifyPhoneCode').addEventListener('click', verifyPhoneCode);
       element('logoutButton').addEventListener('click', signOut);
       setAuthMode('login');
       initializeAuth();
