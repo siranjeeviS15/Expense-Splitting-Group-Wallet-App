@@ -9,13 +9,8 @@ const pool = process.env.DATABASE_URL && !process.env.GROUP_WALLET_DATA_FILE
   : null;
 let useLocalStorage = !pool;
 
-function newSplit(name = '') {
-  return {
-    id: randomUUID(),
-    name: String(name).trim(),
-    members: [],
-    expenses: []
-  };
+function emptyLocalState() {
+  return { users: [], splits: [] };
 }
 
 function writeLocalState(state) {
@@ -24,34 +19,22 @@ function writeLocalState(state) {
 
 function readLocalState() {
   if (!fs.existsSync(DATA_FILE)) {
-    const split = newSplit();
-    const state = { activeSplitId: split.id, splits: [split] };
+    const state = emptyLocalState();
     writeLocalState(state);
     return state;
   }
 
   const parsed = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
-  if (Array.isArray(parsed.splits) && parsed.splits.length) {
-    const state = parsed;
-    for (const split of state.splits) {
-      split.id = String(split.id || randomUUID());
-      split.name = typeof split.name === 'string' ? split.name : '';
-      split.members = Array.isArray(split.members) ? split.members : [];
-      split.expenses = Array.isArray(split.expenses) ? split.expenses : [];
-      for (const expense of split.expenses) {
-        expense.id = String(expense.id || randomUUID());
-      }
-    }
-    if (!state.splits.some((split) => split.id === String(state.activeSplitId))) {
-      state.activeSplitId = state.splits[0].id;
-    }
-    writeLocalState(state);
-    return state;
-  }
-
-  if (Array.isArray(parsed.members) && Array.isArray(parsed.expenses)) {
+  let state;
+  if (Array.isArray(parsed.splits)) {
+    state = {
+      users: Array.isArray(parsed.users) ? parsed.users : [],
+      splits: parsed.splits
+    };
+  } else if (Array.isArray(parsed.members) && Array.isArray(parsed.expenses)) {
     const savedSplit = {
       id: randomUUID(),
+      ownerId: null,
       name: parsed.name === 'Weekend Trip' ? '' : String(parsed.name || ''),
       members: parsed.members.map((member) => String(member).trim()).filter(Boolean),
       expenses: parsed.expenses.map((expense) => ({
@@ -59,25 +42,190 @@ function readLocalState() {
         id: String(expense.id || randomUUID())
       }))
     };
-    const freshSplit = newSplit();
-    const state = {
-      activeSplitId: freshSplit.id,
-      splits: [savedSplit, freshSplit]
-    };
-    writeLocalState(state);
-    return state;
+    state = { ...emptyLocalState(), splits: [savedSplit] };
+  } else {
+    throw new Error('The local split data file has an unsupported format.');
   }
 
-  throw new Error('The local split data file has an unsupported format.');
+  state.users = state.users.map((user) => ({
+    ...user,
+    id: String(user.id || randomUUID()),
+    email: String(user.email || '').toLowerCase()
+  }));
+  for (const split of state.splits) {
+    split.id = String(split.id || randomUUID());
+    split.ownerId = split.ownerId ? String(split.ownerId) : null;
+    split.name = typeof split.name === 'string' ? split.name : '';
+    split.members = Array.isArray(split.members) ? split.members : [];
+    split.expenses = Array.isArray(split.expenses) ? split.expenses : [];
+    for (const expense of split.expenses) {
+      expense.id = String(expense.id || randomUUID());
+    }
+  }
+  writeLocalState(state);
+  return state;
 }
 
-function getLocalSplit(splitId) {
+function requireUserId(userId) {
+  if (!userId) throw new Error('Authentication required');
+  return String(userId);
+}
+
+function localUser(state, userId) {
+  return state.users.find((user) => user.id === String(userId));
+}
+
+function userFromRow(row) {
+  if (!row) return null;
+  return {
+    id: String(row.id),
+    email: row.email,
+    passwordHash: row.password_hash || null,
+    googleId: row.google_id || null
+  };
+}
+
+function publicUser(user) {
+  return user ? { id: user.id, email: user.email } : null;
+}
+
+function newSplit(ownerId, name = '') {
+  return {
+    id: randomUUID(),
+    ownerId: String(ownerId),
+    name: String(name).trim(),
+    members: [],
+    expenses: []
+  };
+}
+
+function getLocalSplit(splitId, userId) {
   const state = readLocalState();
-  const split = state.splits.find((item) => item.id === String(splitId || state.activeSplitId));
-  if (!split) {
-    throw new Error('Split not found');
-  }
+  const ownerId = requireUserId(userId);
+  const split = state.splits.find((item) =>
+    item.id === String(splitId) && item.ownerId === ownerId
+  );
+  if (!split) throw new Error('Split not found');
   return { state, split };
+}
+
+async function createUser(email, passwordHash) {
+  const normalizedEmail = String(email).trim().toLowerCase();
+  if (useLocalStorage) {
+    const state = readLocalState();
+    if (state.users.some((user) => user.email === normalizedEmail)) {
+      const error = new Error('An account with this email already exists.');
+      error.code = 'USER_EXISTS';
+      throw error;
+    }
+    const user = {
+      id: randomUUID(),
+      email: normalizedEmail,
+      passwordHash,
+      googleId: null
+    };
+    state.users.push(user);
+    writeLocalState(state);
+    return publicUser(user);
+  }
+
+  try {
+    const result = await pool.query(`
+      INSERT INTO app_users (email, password_hash)
+      VALUES ($1, $2)
+      RETURNING id, email, password_hash, google_id
+    `, [normalizedEmail, passwordHash]);
+    return publicUser(userFromRow(result.rows[0]));
+  } catch (error) {
+    if (error.code === '23505') {
+      const duplicate = new Error('An account with this email already exists.');
+      duplicate.code = 'USER_EXISTS';
+      throw duplicate;
+    }
+    throw error;
+  }
+}
+
+async function findUserByEmail(email) {
+  const normalizedEmail = String(email).trim().toLowerCase();
+  if (useLocalStorage) {
+    const state = readLocalState();
+    return state.users.find((user) => user.email === normalizedEmail) || null;
+  }
+  const result = await pool.query(
+    'SELECT id, email, password_hash, google_id FROM app_users WHERE email = $1',
+    [normalizedEmail]
+  );
+  return userFromRow(result.rows[0]);
+}
+
+async function findUserById(userId) {
+  if (useLocalStorage) {
+    return publicUser(localUser(readLocalState(), userId));
+  }
+  const result = await pool.query(
+    'SELECT id, email FROM app_users WHERE id = $1',
+    [userId]
+  );
+  return publicUser(result.rows[0]);
+}
+
+async function findOrCreateGoogleUser(email, googleId) {
+  const normalizedEmail = String(email).trim().toLowerCase();
+  if (useLocalStorage) {
+    const state = readLocalState();
+    const googleUser = state.users.find((user) => user.googleId === googleId);
+    if (googleUser) return publicUser(googleUser);
+
+    const emailUser = state.users.find((user) => user.email === normalizedEmail);
+    if (emailUser) {
+      const error = new Error('This email already has an account. Sign in with its original method.');
+      error.code = 'ACCOUNT_LINK_REQUIRED';
+      throw error;
+    }
+
+    const user = {
+      id: randomUUID(),
+      email: normalizedEmail,
+      passwordHash: null,
+      googleId
+    };
+    state.users.push(user);
+    writeLocalState(state);
+    return publicUser(user);
+  }
+
+  const byGoogle = await pool.query(
+    'SELECT id, email FROM app_users WHERE google_id = $1',
+    [googleId]
+  );
+  if (byGoogle.rowCount) return publicUser(byGoogle.rows[0]);
+
+  const byEmail = await pool.query(
+    'SELECT id FROM app_users WHERE email = $1',
+    [normalizedEmail]
+  );
+  if (byEmail.rowCount) {
+    const error = new Error('This email already has an account. Sign in with its original method.');
+    error.code = 'ACCOUNT_LINK_REQUIRED';
+    throw error;
+  }
+
+  try {
+    const result = await pool.query(`
+      INSERT INTO app_users (email, google_id)
+      VALUES ($1, $2)
+      RETURNING id, email
+    `, [normalizedEmail, googleId]);
+    return publicUser(result.rows[0]);
+  } catch (error) {
+    if (error.code === '23505') {
+      const duplicate = new Error('This Google account is already linked.');
+      duplicate.code = 'ACCOUNT_LINK_REQUIRED';
+      throw duplicate;
+    }
+    throw error;
+  }
 }
 
 async function initializeDatabase() {
@@ -88,10 +236,21 @@ async function initializeDatabase() {
 
   try {
     await pool.query(`
+      CREATE TABLE IF NOT EXISTS app_users (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        email TEXT NOT NULL UNIQUE,
+        password_hash TEXT,
+        google_id TEXT UNIQUE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        CHECK (password_hash IS NOT NULL OR google_id IS NOT NULL)
+      );
       CREATE TABLE IF NOT EXISTS groups (
         id SERIAL PRIMARY KEY,
+        owner_id UUID REFERENCES app_users(id) ON DELETE CASCADE,
         name TEXT NOT NULL DEFAULT ''
       );
+      ALTER TABLE groups ADD COLUMN IF NOT EXISTS owner_id UUID REFERENCES app_users(id) ON DELETE CASCADE;
+      CREATE INDEX IF NOT EXISTS groups_owner_id_idx ON groups(owner_id);
       CREATE TABLE IF NOT EXISTS members (
         id SERIAL PRIMARY KEY,
         group_id INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
@@ -111,32 +270,7 @@ async function initializeDatabase() {
         member_id INTEGER NOT NULL REFERENCES members(id) ON DELETE CASCADE,
         PRIMARY KEY (expense_id, member_id)
       );
-      CREATE TABLE IF NOT EXISTS app_settings (
-        key TEXT PRIMARY KEY,
-        value TEXT NOT NULL
-      );
     `);
-
-    const groups = await pool.query('SELECT id FROM groups ORDER BY id');
-    const activeSetting = await pool.query(
-      "SELECT value FROM app_settings WHERE key = 'active_split_id'"
-    );
-    if (groups.rowCount === 0) {
-      const split = await pool.query("INSERT INTO groups (name) VALUES ('') RETURNING id");
-      await pool.query(
-        "INSERT INTO app_settings (key, value) VALUES ('active_split_id', $1)",
-        [String(split.rows[0].id)]
-      );
-    } else if (!activeSetting.rowCount) {
-      const freshSplit = await pool.query("INSERT INTO groups (name) VALUES ('') RETURNING id");
-      await pool.query(`
-        INSERT INTO app_settings (key, value) VALUES ('active_split_id', $1)
-      `, [String(freshSplit.rows[0].id)]);
-    } else if (!groups.rows.some((group) => String(group.id) === activeSetting.rows[0].value)) {
-      await pool.query(`
-        UPDATE app_settings SET value = $1 WHERE key = 'active_split_id'
-      `, [String(groups.rows[0].id)]);
-    }
   } catch (error) {
     if (process.env.REQUIRE_DATABASE === 'true') {
       console.error('PostgreSQL is required but could not be initialized.');
@@ -148,75 +282,94 @@ async function initializeDatabase() {
   }
 }
 
-async function getSplits() {
+async function getSplits(userId, requestedActiveId) {
+  const ownerId = requireUserId(userId);
+  let summaries;
   if (useLocalStorage) {
     const state = readLocalState();
-    return {
-      activeSplitId: state.activeSplitId,
-      splits: state.splits.map((split) => ({
+    if (!state.users.some((user) => user.id === ownerId)) {
+      throw new Error('User not found');
+    }
+    summaries = state.splits
+      .filter((split) => split.ownerId === ownerId)
+      .map((split) => ({
         id: split.id,
         name: split.name,
         memberCount: split.members.length,
         expenseCount: split.expenses.length
-      }))
-    };
+      }));
+  } else {
+    const result = await pool.query(`
+      SELECT g.id, g.name,
+             (SELECT COUNT(*) FROM members m WHERE m.group_id = g.id)::int AS "memberCount",
+             (SELECT COUNT(*) FROM expenses e WHERE e.group_id = g.id)::int AS "expenseCount"
+      FROM groups g
+      WHERE g.owner_id = $1
+      ORDER BY g.id
+    `, [ownerId]);
+    summaries = result.rows.map((split) => ({ ...split, id: String(split.id) }));
   }
 
-  const result = await pool.query(`
-    SELECT g.id, g.name,
-           (SELECT COUNT(*) FROM members m WHERE m.group_id = g.id)::int AS "memberCount",
-           (SELECT COUNT(*) FROM expenses e WHERE e.group_id = g.id)::int AS "expenseCount"
-    FROM groups g
-    ORDER BY g.id
-  `);
-  const active = await pool.query(
-    "SELECT value FROM app_settings WHERE key = 'active_split_id'"
-  );
-  return {
-    activeSplitId: active.rows[0].value,
-    splits: result.rows.map((split) => ({ ...split, id: String(split.id) }))
-  };
+  if (!summaries.length) {
+    const split = await createSplit('', ownerId);
+    summaries = [{
+      id: String(split.id),
+      name: split.name,
+      memberCount: 0,
+      expenseCount: 0
+    }];
+  }
+
+  const activeSplitId = summaries.some((split) => split.id === String(requestedActiveId))
+    ? String(requestedActiveId)
+    : summaries[0].id;
+  return { activeSplitId, splits: summaries };
 }
 
-async function createSplit(name = '') {
+async function createSplit(name = '', userId) {
+  const ownerId = requireUserId(userId);
   const splitName = String(name || '').trim();
   if (useLocalStorage) {
     const state = readLocalState();
-    const split = newSplit(splitName);
+    if (!state.users.some((user) => user.id === ownerId)) throw new Error('User not found');
+    const split = newSplit(ownerId, splitName);
     state.splits.push(split);
-    state.activeSplitId = split.id;
     writeLocalState(state);
     return split;
   }
 
   const result = await pool.query(
-    'INSERT INTO groups (name) VALUES ($1) RETURNING id, name',
-    [splitName]
+    'INSERT INTO groups (owner_id, name) VALUES ($1, $2) RETURNING id, name',
+    [ownerId, splitName]
   );
-  const split = { ...result.rows[0], id: String(result.rows[0].id), members: [], expenses: [] };
-  await setActiveSplit(split.id);
-  return split;
+  return {
+    ...result.rows[0],
+    id: String(result.rows[0].id),
+    ownerId,
+    members: [],
+    expenses: []
+  };
 }
 
-async function deleteSplit(splitId) {
+async function deleteSplit(splitId, userId) {
+  const ownerId = requireUserId(userId);
   if (useLocalStorage) {
     const state = readLocalState();
-    const splitIndex = state.splits.findIndex((split) => split.id === String(splitId));
+    const splitIndex = state.splits.findIndex((split) =>
+      split.id === String(splitId) && split.ownerId === ownerId
+    );
     if (splitIndex === -1) throw new Error('Split not found');
-
     state.splits.splice(splitIndex, 1);
-    if (!state.splits.length) {
-      const replacement = newSplit();
+    let remaining = state.splits.filter((split) => split.ownerId === ownerId);
+    if (!remaining.length) {
+      const replacement = newSplit(ownerId);
       state.splits.push(replacement);
-      state.activeSplitId = replacement.id;
-    } else if (!state.splits.some((split) => split.id === state.activeSplitId)) {
-      state.activeSplitId = state.splits[0].id;
+      remaining = [replacement];
     }
-
     writeLocalState(state);
     return {
-      activeSplitId: state.activeSplitId,
-      split: state.splits.find((split) => split.id === state.activeSplitId)
+      activeSplitId: remaining[0].id,
+      split: remaining[0]
     };
   }
 
@@ -225,34 +378,23 @@ async function deleteSplit(splitId) {
   try {
     await client.query('BEGIN');
     const deleted = await client.query(
-      'DELETE FROM groups WHERE id = $1 RETURNING id',
-      [splitId]
+      'DELETE FROM groups WHERE id = $1 AND owner_id = $2 RETURNING id',
+      [splitId, ownerId]
     );
     if (!deleted.rowCount) throw new Error('Split not found');
 
-    const remaining = await client.query('SELECT id FROM groups ORDER BY id');
-    const active = await client.query(
-      "SELECT value FROM app_settings WHERE key = 'active_split_id' FOR UPDATE"
+    let remaining = await client.query(
+      'SELECT id FROM groups WHERE owner_id = $1 ORDER BY id',
+      [ownerId]
     );
-    const activeStillExists = remaining.rows.some((split) =>
-      String(split.id) === active.rows[0]?.value
-    );
-
-    if (activeStillExists) {
-      nextActiveSplitId = active.rows[0].value;
-    } else if (remaining.rowCount) {
-      nextActiveSplitId = String(remaining.rows[0].id);
-    } else {
+    if (!remaining.rowCount) {
       const replacement = await client.query(
-        "INSERT INTO groups (name) VALUES ('') RETURNING id"
+        "INSERT INTO groups (owner_id, name) VALUES ($1, '') RETURNING id",
+        [ownerId]
       );
-      nextActiveSplitId = String(replacement.rows[0].id);
+      remaining = { rows: replacement.rows, rowCount: 1 };
     }
-
-    await client.query(`
-      INSERT INTO app_settings (key, value) VALUES ('active_split_id', $1)
-      ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
-    `, [nextActiveSplitId]);
+    nextActiveSplitId = String(remaining.rows[0].id);
     await client.query('COMMIT');
   } catch (error) {
     await client.query('ROLLBACK');
@@ -263,46 +405,25 @@ async function deleteSplit(splitId) {
 
   return {
     activeSplitId: nextActiveSplitId,
-    split: await loadGroup(nextActiveSplitId)
+    split: await loadGroup(nextActiveSplitId, ownerId)
   };
 }
 
-async function setActiveSplit(splitId) {
-  if (useLocalStorage) {
-    const state = readLocalState();
-    const split = state.splits.find((item) => item.id === String(splitId));
-    if (!split) throw new Error('Split not found');
-    state.activeSplitId = split.id;
-    writeLocalState(state);
-    return split;
-  }
-
-  const result = await pool.query('SELECT id FROM groups WHERE id = $1', [splitId]);
-  if (!result.rowCount) throw new Error('Split not found');
-  await pool.query(`
-    INSERT INTO app_settings (key, value) VALUES ('active_split_id', $1)
-    ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
-  `, [String(splitId)]);
-  return loadGroup(splitId);
+async function setActiveSplit(splitId, userId) {
+  return loadGroup(splitId, userId);
 }
 
-async function getActiveSplitId() {
+async function loadGroup(splitId, userId) {
+  const ownerId = requireUserId(userId);
   if (useLocalStorage) {
-    return readLocalState().activeSplitId;
+    return getLocalSplit(splitId, ownerId).split;
   }
-  const result = await pool.query(
-    "SELECT value FROM app_settings WHERE key = 'active_split_id'"
+
+  const id = splitId || (await getSplits(ownerId)).activeSplitId;
+  const groupResult = await pool.query(
+    'SELECT id, name FROM groups WHERE id = $1 AND owner_id = $2',
+    [id, ownerId]
   );
-  return result.rows[0].value;
-}
-
-async function loadGroup(splitId) {
-  if (useLocalStorage) {
-    return getLocalSplit(splitId).split;
-  }
-
-  const id = splitId || await getActiveSplitId();
-  const groupResult = await pool.query('SELECT id, name FROM groups WHERE id = $1', [id]);
   const group = groupResult.rows[0];
   if (!group) throw new Error('Split not found');
 
@@ -340,15 +461,17 @@ async function loadGroup(splitId) {
 
   return {
     id: String(group.id),
+    ownerId,
     name: group.name,
     members: membersResult.rows.map((member) => member.name),
     expenses
   };
 }
 
-async function saveExpense(expense, splitId) {
+async function saveExpense(expense, splitId, userId) {
+  const ownerId = requireUserId(userId);
   if (useLocalStorage) {
-    const { state, split } = getLocalSplit(splitId);
+    const { state, split } = getLocalSplit(splitId, ownerId);
     const participants = expense.participants;
     const entry = {
       ...expense,
@@ -365,7 +488,12 @@ async function saveExpense(expense, splitId) {
     return entry;
   }
 
-  const groupId = splitId || await getActiveSplitId();
+  const groupId = splitId || (await getSplits(ownerId)).activeSplitId;
+  const groupResult = await pool.query(
+    'SELECT id FROM groups WHERE id = $1 AND owner_id = $2',
+    [groupId, ownerId]
+  );
+  if (!groupResult.rowCount) throw new Error('Split not found');
   const payerResult = await pool.query(
     'SELECT id FROM members WHERE group_id = $1 AND LOWER(name) = LOWER($2)',
     [groupId, expense.paidBy]
@@ -405,12 +533,13 @@ async function saveExpense(expense, splitId) {
   }
 }
 
-async function addMember(name, splitId) {
+async function addMember(name, splitId, userId) {
+  const ownerId = requireUserId(userId);
   const trimmedName = String(name || '').trim();
   if (!trimmedName) throw new Error('Member name is required');
 
   if (useLocalStorage) {
-    const { state, split } = getLocalSplit(splitId);
+    const { state, split } = getLocalSplit(splitId, ownerId);
     if (!split.members.some((member) => member.toLowerCase() === trimmedName.toLowerCase())) {
       split.members.push(trimmedName);
       writeLocalState(state);
@@ -418,18 +547,21 @@ async function addMember(name, splitId) {
     return split.members;
   }
 
-  const groupId = splitId || await getActiveSplitId();
+  const groupId = splitId || (await getSplits(ownerId)).activeSplitId;
   const result = await pool.query(`
-    INSERT INTO members (group_id, name) VALUES ($1, $2)
+    INSERT INTO members (group_id, name)
+    SELECT id, $3 FROM groups WHERE id = $1 AND owner_id = $2
     ON CONFLICT (group_id, name) DO UPDATE SET name = EXCLUDED.name
     RETURNING name
-  `, [groupId, trimmedName]);
+  `, [groupId, ownerId, trimmedName]);
+  if (!result.rowCount) throw new Error('Split not found');
   return result.rows[0].name;
 }
 
-async function deleteExpense(expenseId, splitId) {
+async function deleteExpense(expenseId, splitId, userId) {
+  const ownerId = requireUserId(userId);
   if (useLocalStorage) {
-    const { state, split } = getLocalSplit(splitId);
+    const { state, split } = getLocalSplit(splitId, ownerId);
     const originalCount = split.expenses.length;
     split.expenses = split.expenses.filter((expense) => String(expense.id) !== String(expenseId));
     if (split.expenses.length === originalCount) throw new Error('Expense not found');
@@ -437,16 +569,18 @@ async function deleteExpense(expenseId, splitId) {
     return;
   }
 
-  const result = await pool.query(
-    'DELETE FROM expenses WHERE id = $1 AND group_id = $2',
-    [expenseId, splitId || await getActiveSplitId()]
-  );
+  const result = await pool.query(`
+    DELETE FROM expenses e
+    USING groups g
+    WHERE e.id = $1 AND e.group_id = $2 AND g.id = e.group_id AND g.owner_id = $3
+  `, [expenseId, splitId, ownerId]);
   if (!result.rowCount) throw new Error('Expense not found');
 }
 
-async function deleteMember(name, splitId) {
+async function deleteMember(name, splitId, userId) {
+  const ownerId = requireUserId(userId);
   if (useLocalStorage) {
-    const { state, split } = getLocalSplit(splitId);
+    const { state, split } = getLocalSplit(splitId, ownerId);
     const member = split.members.find((item) => item.toLowerCase() === String(name).toLowerCase());
     if (!member) throw new Error('Member not found');
     const isUsed = split.expenses.some((expense) =>
@@ -460,33 +594,43 @@ async function deleteMember(name, splitId) {
     return;
   }
 
-  const groupId = splitId || await getActiveSplitId();
-  const memberResult = await pool.query(
-    'SELECT id FROM members WHERE group_id = $1 AND LOWER(name) = LOWER($2)',
-    [groupId, name]
-  );
+  const groupId = splitId;
+  const memberResult = await pool.query(`
+    SELECT m.id
+    FROM members m
+    JOIN groups g ON g.id = m.group_id
+    WHERE g.id = $1 AND g.owner_id = $2 AND LOWER(m.name) = LOWER($3)
+  `, [groupId, ownerId, name]);
   if (!memberResult.rowCount) throw new Error('Member not found');
   const memberId = memberResult.rows[0].id;
   const usedResult = await pool.query(`
     SELECT 1
     FROM expenses e
+    JOIN groups g ON g.id = e.group_id
     LEFT JOIN expense_participants ep ON ep.expense_id = e.id
-    WHERE e.group_id = $1 AND (e.paid_by = $2 OR ep.member_id = $2)
+    WHERE g.id = $1 AND g.owner_id = $2
+      AND (e.paid_by = $3 OR ep.member_id = $3)
     LIMIT 1
-  `, [groupId, memberId]);
+  `, [groupId, ownerId, memberId]);
   if (usedResult.rowCount) {
     throw new Error('Cannot remove a member who is part of a saved expense');
   }
-  await pool.query('DELETE FROM members WHERE id = $1 AND group_id = $2', [memberId, groupId]);
+  await pool.query(
+    'DELETE FROM members WHERE id = $1 AND group_id = $2',
+    [memberId, groupId]
+  );
 }
 
 module.exports = {
   addMember,
   createSplit,
+  createUser,
   deleteExpense,
   deleteMember,
   deleteSplit,
-  getActiveSplitId,
+  findOrCreateGoogleUser,
+  findUserByEmail,
+  findUserById,
   getSplits,
   initializeDatabase,
   loadGroup,

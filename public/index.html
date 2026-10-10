@@ -31,6 +31,14 @@
       .participants label { display: inline-flex; align-items: center; gap: 4px; }
       .participants input { min-width: auto; margin: 0; }
       .hint { color: #6b7280; font-size: .95rem; }
+      [hidden] { display: none !important; }
+      .auth-card { max-width: 440px; margin: 8vh auto 0; }
+      .auth-card form { display: grid; gap: 8px; }
+      .auth-card form input { width: 100%; }
+      .auth-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+      .auth-actions button { flex: 1; }
+      .auth-divider { text-align: center; color: #6b7280; margin: 18px 0 6px; }
+      .account-bar { display: flex; justify-content: flex-end; align-items: center; gap: 12px; }
       @media (max-width: 560px) {
         .container { padding: 14px; }
         .card { padding: 16px; }
@@ -39,7 +47,29 @@
     </style>
   </head>
   <body>
-    <main class="container">
+    <section id="authPanel" class="card auth-card" aria-labelledby="auth-title" hidden>
+      <h1 id="auth-title">Sign in to Expense Splitter</h1>
+      <p id="authStatus" class="status" role="status" aria-live="polite"></p>
+      <form id="authForm">
+        <label for="authEmail">Email</label>
+        <input id="authEmail" type="email" autocomplete="email" maxlength="254" required />
+        <label for="authPassword">Password</label>
+        <input id="authPassword" type="password" autocomplete="current-password" minlength="12" maxlength="1024" required />
+        <div class="auth-actions">
+          <button id="authSubmit" type="submit">Sign in</button>
+          <button id="authModeToggle" class="secondary" type="button">Create account</button>
+        </div>
+      </form>
+      <p id="passwordHint" class="hint" hidden>Use at least 12 characters for a new password.</p>
+      <p id="googleDivider" class="auth-divider" hidden>or</p>
+      <a id="googleSignIn" class="button-link" href="/auth/google" hidden>Continue with Google</a>
+    </section>
+
+    <main id="application" class="container" hidden>
+      <div class="account-bar">
+        <span id="accountEmail"></span>
+        <button id="logoutButton" class="secondary" type="button">Sign out</button>
+      </div>
       <h1>Expense Splitter</h1>
       <div id="status" class="status" role="status" aria-live="polite"></div>
 
@@ -104,6 +134,9 @@
     <script>
       const element = (id) => document.getElementById(id);
       let savedSplits = [];
+      let csrfToken;
+      let authMode = 'login';
+      let currentUser;
 
       function showStatus(message, isError = false) {
         const status = element('status');
@@ -112,10 +145,108 @@
       }
 
       async function request(url, options) {
-        const response = await fetch(url, options);
+        const requestOptions = options || {};
+        const method = (requestOptions.method || 'GET').toUpperCase();
+        const headers = new Headers(requestOptions.headers || {});
+        if (method !== 'GET' && method !== 'HEAD' && csrfToken) {
+          headers.set('X-CSRF-Token', csrfToken);
+        }
+        const response = await fetch(url, { ...requestOptions, headers });
         const result = await response.json().catch(() => ({}));
         if (!response.ok) throw new Error(result.error || 'The request could not be completed.');
         return result;
+      }
+
+      function setAuthStatus(message, isError = false) {
+        const status = element('authStatus');
+        status.textContent = message;
+        status.classList.toggle('error', isError);
+      }
+
+      function showAuthenticated(user) {
+        currentUser = user;
+        element('authPanel').hidden = true;
+        element('application').hidden = false;
+        element('accountEmail').textContent = user.email;
+      }
+
+      function showLogin(message = '') {
+        currentUser = null;
+        element('application').hidden = true;
+        element('authPanel').hidden = false;
+        element('authEmail').value = '';
+        element('authPassword').value = '';
+        setAuthStatus(message);
+      }
+
+      function setAuthMode(mode) {
+        authMode = mode;
+        const registering = mode === 'register';
+        element('auth-title').textContent = registering ? 'Create your account' : 'Sign in to Expense Splitter';
+        element('authSubmit').textContent = registering ? 'Create account' : 'Sign in';
+        element('authModeToggle').textContent = registering ? 'I already have an account' : 'Create account';
+        element('authPassword').autocomplete = registering ? 'new-password' : 'current-password';
+        element('authPassword').minLength = registering ? 12 : 1;
+        element('passwordHint').hidden = !registering;
+      }
+
+      async function initializeAuth() {
+        try {
+          const auth = await request('/api/auth/me');
+          csrfToken = auth.csrfToken;
+          element('googleSignIn').hidden = !auth.googleEnabled;
+          element('googleDivider').hidden = !auth.googleEnabled;
+          const params = new URLSearchParams(window.location.search);
+          if (params.get('authError') === 'google') {
+            setAuthStatus('Google sign-in failed or could not be linked. Try email/password or contact support.', true);
+            window.history.replaceState({}, '', window.location.pathname);
+          }
+          if (auth.authenticated) {
+            showAuthenticated(auth.user);
+            await loadData();
+          } else {
+            showLogin(element('authStatus').textContent);
+          }
+        } catch (error) {
+          showLogin(error.message || 'Unable to connect to the sign-in service.');
+          setAuthStatus(error.message || 'Unable to connect to the sign-in service.', true);
+        }
+      }
+
+      async function submitAuth(event) {
+        event.preventDefault();
+        const email = element('authEmail').value.trim();
+        const password = element('authPassword').value;
+        const endpoint = authMode === 'register' ? '/api/auth/register' : '/api/auth/login';
+        const submit = element('authSubmit');
+        submit.disabled = true;
+        setAuthStatus(authMode === 'register' ? 'Creating account…' : 'Signing in…');
+        try {
+          const result = await request(endpoint, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ email, password })
+          });
+          csrfToken = result.csrfToken;
+          showAuthenticated(result.user);
+          showStatus('Signed in successfully.');
+          await loadData();
+        } catch (error) {
+          setAuthStatus(error.message || 'Authentication failed.', true);
+        } finally {
+          submit.disabled = false;
+        }
+      }
+
+      async function signOut() {
+        try {
+          await request('/api/auth/logout', { method: 'POST' });
+          csrfToken = null;
+          showLogin('You have signed out.');
+          setAuthMode('login');
+        } catch (error) {
+          showStatus(error.message || 'Could not sign out.', true);
+        }
       }
 
       function addListMessage(list, message) {
@@ -277,7 +408,12 @@
           renderSplits(splitData);
           renderGroup(group, balances, summary, settlements);
         } catch (error) {
-          showStatus(error.message || 'Unable to load split data.', true);
+          if (error.message === 'Please sign in to continue.') {
+            csrfToken = null;
+            showLogin('Your session has expired. Please sign in again.');
+          } else {
+            showStatus(error.message || 'Unable to load split data.', true);
+          }
         }
       }
 
@@ -407,7 +543,14 @@
         }
       }
 
-      loadData();
+      element('authForm').addEventListener('submit', submitAuth);
+      element('authModeToggle').addEventListener('click', () => {
+        setAuthMode(authMode === 'login' ? 'register' : 'login');
+        setAuthStatus('');
+      });
+      element('logoutButton').addEventListener('click', signOut);
+      setAuthMode('login');
+      initializeAuth();
     </script>
   </body>
 </html>
