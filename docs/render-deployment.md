@@ -11,6 +11,14 @@ This project uses a single Render Node web service for both the frontend and API
 
 The production service sets `REQUIRE_DATABASE=true`: if PostgreSQL cannot be initialized, startup fails instead of silently switching to temporary local-file storage.
 
+The Blueprint generates a `SESSION_SECRET`. To enable optional Google sign-in:
+
+1. Create a Google OAuth client with the web application type.
+2. Add `https://<your-render-service>.onrender.com/auth/google/callback` as an authorized redirect URI.
+3. Add `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` to the Render service environment and redeploy.
+
+Email/password registration works without Google credentials. Passwords are stored as salted scrypt hashes, and authenticated sessions are stored in PostgreSQL. Email verification and password recovery are not configured.
+
 ## Data and plan notes
 
 New PostgreSQL deployments start with a blank split. Existing local `data.json` is not uploaded or automatically imported; export and migrate any data you need separately before relying on the cloud app.
